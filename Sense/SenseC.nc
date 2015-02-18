@@ -44,7 +44,8 @@
 
 #include "Timer.h"
 #include "blip_printf.h"
- #include <lib6lowpan/ip.h>
+#include <lib6lowpan/ip.h>
+
 
 module SenseC
 {
@@ -52,26 +53,40 @@ module SenseC
     interface Boot;
     interface Leds;
     interface Timer<TMilli>;
-    interface Timer<TMilli> as reply;
+    interface Timer<TMilli> as calib;
+    interface Timer<TMilli> as calib_5s;
+    interface Timer<TMilli> as calib_1s;
+    interface Timer<TMilli> as game_timer;
+    interface Timer<TMilli> as compete_timer;
+
+
+    
     interface Read<uint16_t>;
     interface ShellCommand  as ReadCmd;
+    interface ShellCommand  as SyncCmd; 
+    interface ShellCommand  as StopCmd;
+    interface UDP as multicastUdp;
+    interface UDP as multicastUdp_gameover;
     interface SplitControl as RadioControl;
 
   }
 }
+
 implementation
 {
   // sampling frequency in binary milliseconds
   #define SAMPLING_FREQUENCY 16 //24
+  #define REPORT_DEST "fec0::100"
+  #define MULTICAST "ff02::1"
   //#define SERIAL_FREQUENCY 20
-  
+  uint16_t BPM_Avg=0;
   /*Main*/
   volatile uint16_t BPM;                   // used to hold the pulse rate
   volatile uint16_t Signal;                // holds the incoming raw data
   volatile uint16_t IBI = 600;             // holds the time between beats, must be seeded! 
   volatile bool Pulse = FALSE;        // true when pulse wave is high, false when it's low
   volatile bool QS = TRUE;            // becomes true when we find a beat.
-
+   uint16_t BPM_game,BPM_max=0;
 
   /*Timer part*/
   volatile int rate[10];                              // array to hold last ten IBI values
@@ -83,19 +98,198 @@ implementation
   volatile int amp = 100;                             // used to hold amplitude of pulse waveform, seeded
   volatile bool firstBeat = TRUE;                     // used to seed rate array so we startup with reasonable BPM
   volatile bool secondBeat = FALSE;                   // used to seed rate array so we startup with reasonable BPM
+  volatile bool flag_self= FALSE;                          // flag to check whether calibration is done
+  volatile bool flag_other=FALSE;
+  volatile bool flag_lost=FALSE;
+
+  struct sockaddr_in6 multicast;
+  struct sockaddr_in6 route_dest;
   int N;
   int i=0;
   uint16_t runningTotal=0;
 
+typedef nx_struct statistics{
+  //nx_uint16_t thresHold;
+  //nx_uint16_t value;
+  nx_uint16_t type;
+  nx_uint16_t sender;
+} stat_statistics;
+
+
+enum{
+  CALIBRATION = 1,
+  BEATS = 2,
+  THRESHOLD=3,
+  LOST=4,
+};
+
+  stat_statistics stats,stats_recv,game_send,game_recv;
+
   event void Boot.booted() {
-    call Timer.startPeriodic(SAMPLING_FREQUENCY);
-    //call SerialSender.startPeriodic(SERIAL_FREQUENCY);
+    
+     route_dest.sin6_port = htons(7000);
+     inet_pton6(MULTICAST, &route_dest.sin6_addr);
+     call multicastUdp.bind(7000);
+
+     multicast.sin6_port = htons(4000);
+     inet_pton6(MULTICAST, &multicast.sin6_addr);
+     call multicastUdp_gameover.bind(4000);
+
+  
     call RadioControl.start();
+    //call calib.stop();
+    call calib.startOneShot(3000);
+    call Timer.startPeriodic(SAMPLING_FREQUENCY);
+    //call Leds.led0On();
+
   }
 
   event void RadioControl.stopDone(error_t e){}
   event void RadioControl.startDone(error_t e){}
+  
 
+  event void calib.fired(){
+    char *reply_buf = call ReadCmd.getBuffer(50);
+    int len ;
+    BPM_game=BPM;
+    if (BPM_game<=60)
+    {
+    
+     call Leds.led0On();
+     call Leds.led2Off();
+    
+   
+    
+    len=sprintf(reply_buf,"Beats per minute :%d \n",BPM);
+    call ReadCmd.write(reply_buf,len);
+     
+    call calib.startOneShot(3000);
+    }
+    else
+    {
+
+          call Leds.led0Off();
+          call Leds.led2On();
+          call calib_5s.startOneShot(8000);
+          call calib_1s.startPeriodic(1000);
+    }
+
+    //call Leds.led2On();
+    // call calib.stop();
+   
+  
+}
+
+
+event void calib_1s.fired()
+{
+ char *reply_buf = call ReadCmd.getBuffer(50);
+ int len ;
+ BPM_Avg+=BPM;
+ len= sprintf(reply_buf,"BPM taking average: %d:\n",BPM_Avg);
+ call ReadCmd.write(reply_buf,len);
+
+}
+event void calib_5s.fired()
+{
+ char *reply_buf = call ReadCmd.getBuffer(50);
+    int len ;
+call calib_1s.stop();
+BPM_Avg=BPM_Avg/7;
+len= sprintf(reply_buf,"BPM Avg: %d:\n",BPM_Avg);
+call ReadCmd.write(reply_buf,len);
+if(BPM_Avg>=85)
+{
+  stats.type=CALIBRATION;
+  stats.sender=TOS_NODE_ID;
+  call multicastUdp.sendto(&route_dest, &stats,sizeof(stats));
+  flag_self=TRUE;
+  if (flag_other==TRUE)
+  { //start game
+    len= sprintf(reply_buf,"Starting game\n");
+  call ReadCmd.write(reply_buf,len);
+  call game_timer.startOneShot(10000);
+  call compete_timer.startPeriodic(1000);
+}
+}
+else
+{
+  len= sprintf(reply_buf,"Calibrating again:\n");
+  call ReadCmd.write(reply_buf,len);
+  call calib.startOneShot(3000);
+}
+}
+event void multicastUdp_gameover.recvfrom(struct sockaddr_in6 *from, void *data, uint16_t len, struct ip6_metadata *meta)
+{
+  int leng ;
+  char *reply_buf = call ReadCmd.getBuffer(50);
+  memcpy(&stats_recv, data, sizeof(stats_recv));
+  if(stats_recv.type==LOST)
+  {
+   flag_lost=TRUE;
+  }
+}
+ event void multicastUdp.recvfrom(struct sockaddr_in6 *from, void *data, uint16_t len, struct ip6_metadata *meta)
+{
+  int leng ;
+  char *reply_buf = call ReadCmd.getBuffer(50);
+  memcpy(&stats_recv, data, sizeof(stats_recv));
+  if(stats_recv.type==CALIBRATION)
+  flag_other=TRUE; 
+ if(flag_self==TRUE)
+ {
+  leng= sprintf(reply_buf,"Starting game\n");
+  call ReadCmd.write(reply_buf,leng); // start game here
+  call game_timer.startOneShot(10000);
+  call compete_timer.startPeriodic(1000);
+  //call Leds.led0On();
+}
+/*else if(stats_recv.type==LOST)
+{
+  flag_lost=TRUE;
+  leng= sprintf(reply_buf,"I won\n");
+  call game_timer.stop();
+  call compete_timer.stop();
+  call ReadCmd.write(reply_buf,leng);
+}
+else 
+;*/
+}
+event void game_timer.fired()
+{
+ char *reply_buf = call ReadCmd.getBuffer(50);
+int len ;
+call compete_timer.stop();
+len=sprintf(reply_buf,"Tie game\n");
+call ReadCmd.write(reply_buf,len);
+}
+event void compete_timer.fired()
+{char *reply_buf = call ReadCmd.getBuffer(50);
+int len ;
+ len= sprintf(reply_buf,"My BPM is: %d \n",BPM);
+ call ReadCmd.write(reply_buf,len);
+ 
+ if (flag_lost==TRUE)
+  {
+    call compete_timer.stop();
+    call game_timer.stop();
+    len= sprintf(reply_buf,"I Won in if cond\n");
+  call ReadCmd.write(reply_buf,len);
+  }
+  else if ((BPM>BPM_Avg+10)||(BPM<BPM_Avg-10))
+  {
+  len= sprintf(reply_buf,"I lost in game_timer\n");
+  call ReadCmd.write(reply_buf,len);
+  call game_timer.stop();
+  call compete_timer.stop();
+  stats.type=LOST;
+  stats.sender=TOS_NODE_ID;
+  //flag_lost=TRUE;
+  call multicastUdp_gameover.sendto(&route_dest, &stats,sizeof(stats));
+  //multicast  
+  }
+
+}
   event void Timer.fired() 
   {
     call Read.read();
@@ -103,7 +297,8 @@ implementation
 
   event void Read.readDone(error_t result, uint16_t data) 
   {    
-      atomic {                                      //no interrupt while doing this part 
+      printf("%d\n",data );
+                                            //no interrupt while doing this part 
         Signal = data;                              // read the Pulse Sensor 
         sampleCounter += 16;                        // keep track of the time in mS with this variable
         N = sampleCounter - lastBeatTime;           // monitor the time since the last beat to avoid noise
@@ -180,21 +375,45 @@ implementation
 
 
         /*Atomic ends here*/
-      }
+      
 
   }
    event char* ReadCmd.eval(int argc, char** argv) {
-    char *reply_buf = call ReadCmd.getBuffer(128);
-    int len = 0;
+    char *reply_buf = call ReadCmd.getBuffer(50);
+    int len ;
     len=sprintf(reply_buf,"Beats per minute :%d \n",BPM);
     return reply_buf;
   }
-  /*event void reply.fired()
-  {
-    char *reply_buf = call ReadCmd.getBuffer(128);
-    int len = 0;
-    len=sprintf(reply_buf,"Beats per minute :%d \n",BPM);
-    return reply_buf;
+  //event void game.fired() {}
+  
 
-  }*/
+
+  
+
+  event char* SyncCmd.eval(int argc, char** argv)
+    {
+      char *reply_buf= call SyncCmd.getBuffer(50);
+      int len; 
+      len=sprintf(reply_buf,"Starting Game\n");
+      //call Leds.led0Off();
+      //flag=TRUE;
+      //call game.startOneShot(10000);
+      return reply_buf;
+    }
+    event char* StopCmd.eval(int argc, char* argv[]) 
+    {
+    char* reply_buf = call StopCmd.getBuffer(35);
+    int len;
+    len= sprintf(reply_buf,"Stoping Run\n");
+    //call Leds.led0On();
+    //flag=FALSE;
+    return reply_buf;
+    }
+   /* event  char* StartGame(int argc,char* argv)
+    {
+      char* reply_buf = call StopCmd.getBuffer(35);
+      int len=0;
+      
+
+    }*/
 }
